@@ -45,6 +45,8 @@ What I learned on the way:
 - **Pinning threads to the fast cores loses on an awake headset.** The VR compositor lives there. Letting the
   scheduler decide gave 38% over my own pinned build.
 - **The default context reserves 1.5 GB of KV for a sentence.** Sizing it for speech freed the memory and the swap.
+- **On the Adreno the Q8 kernel sums in half precision, and LFM3 does not survive it.** KL divergence 0.668 against the
+  CPU. Fifteen lines that accumulate in float bring it to 0.00195. It ships here as its own patch.
 - **The backbone is limited by memory bandwidth, not compute.** The GPU reads 1.5 GB of weights per token at 33 GB/s.
   Smarter kernels gave nothing. Reading fewer bytes is the only lever left.
 - **With the codec on its own thread, 3 threads run as fast as 4** (68.6 against 68.1 ms). One core goes back to the app.
@@ -81,6 +83,7 @@ The patch already sets the GPU offload and the context size, so there are no ext
 |---|---|
 | `patches/voice-quest3s-full.patch` | all six steps, 68.1 ms per frame |
 | `patches/voice-quest3s-q8-only.patch` | steps 1 to 5, weights stay Q8, 70.0 ms per frame |
+| `patches/opencl-adreno-q8-f32-accum.patch` | standalone, already inside the two patches above: the Adreno Q8 gemm kernel accumulates in float instead of half. On LFM3-Omni the KL divergence against the CPU backend drops from 0.668 to 0.00195, generation speed unchanged, prompt evaluation 29% slower. Useful to anyone running LFM3 on an Adreno GPU, with or without the voice |
 | `patches/opencl-lazy-cold-start.patch` | optional, on top of either one: the first launch after install drops from 53 s to about 20 s by compiling only the OpenCL programs the voice uses, same audio bit for bit |
 
 Both main patches include the timing counters I used to measure each stage.

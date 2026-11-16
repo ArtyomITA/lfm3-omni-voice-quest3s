@@ -1,0 +1,80 @@
+diff --git a/ggml/src/ggml-opencl/kernels/gemm_noshuffle_q8_0_f32.cl b/ggml/src/ggml-opencl/kernels/gemm_noshuffle_q8_0_f32.cl
+index 7f06a22..f5a40ae 100644
+--- a/ggml/src/ggml-opencl/kernels/gemm_noshuffle_q8_0_f32.cl
++++ b/ggml/src/ggml-opencl/kernels/gemm_noshuffle_q8_0_f32.cl
+@@ -32,16 +32,15 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
+     dst  = (global float *)((global char*)dst  + offsetd);
+ 
+ 
+-    half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+-    half8 B;
+-    half4 deq;
++    float8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
++    float8 B;
+ 
+     __global const uint* wptr = src0_q + gx_2;
+     __global const half* sptr = src0_d + gx_2;
+ 
+       for (int i = 0; i < k; i += 4) {
+         uint4 pack4 = vload4(0, wptr + (i / 4) * m);
+-        half4 scale = vload4(0, sptr + (i / 32) * m);
++        float4 scale = convert_float4(vload4(0, sptr + (i / 32) * m));
+ 
+         char4 p0 = as_char4(pack4.s0);
+         char4 p1 = as_char4(pack4.s1);
+@@ -49,10 +48,10 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
+         char4 p3 = as_char4(pack4.s3);
+ 
+         // ------------------- j = 0 (k = i+0) -------------------
+-        B.s0123 = read_imageh(src1, gy * 2 + (i + 0) * n_4);
+-        B.s4567 = read_imageh(src1, gy * 2 + (i + 0) * n_4 + 1);
++        B.s0123 = read_imagef(src1, gy * 2 + (i + 0) * n_4);
++        B.s4567 = read_imagef(src1, gy * 2 + (i + 0) * n_4 + 1);
+ 
+-        half4 wj0 = convert_half4((char4)(p0.s0, p1.s0, p2.s0, p3.s0)) * scale;
++        float4 wj0 = convert_float4((char4)(p0.s0, p1.s0, p2.s0, p3.s0)) * scale;
+ 
+         c0 += B * wj0.s0;
+         c1 += B * wj0.s1;
+@@ -60,10 +59,10 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
+         c3 += B * wj0.s3;
+ 
+         // ------------------- j = 1 (k = i+1) -------------------
+-        B.s0123 = read_imageh(src1, gy * 2 + (i + 1) * n_4);
+-        B.s4567 = read_imageh(src1, gy * 2 + (i + 1) * n_4 + 1);
++        B.s0123 = read_imagef(src1, gy * 2 + (i + 1) * n_4);
++        B.s4567 = read_imagef(src1, gy * 2 + (i + 1) * n_4 + 1);
+ 
+-        half4 wj1 = convert_half4((char4)(p0.s1, p1.s1, p2.s1, p3.s1)) * scale;
++        float4 wj1 = convert_float4((char4)(p0.s1, p1.s1, p2.s1, p3.s1)) * scale;
+ 
+         c0 += B * wj1.s0;
+         c1 += B * wj1.s1;
+@@ -71,10 +70,10 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
+         c3 += B * wj1.s3;
+ 
+         // ------------------- j = 2 (k = i+2) -------------------
+-        B.s0123 = read_imageh(src1, gy * 2 + (i + 2) * n_4);
+-        B.s4567 = read_imageh(src1, gy * 2 + (i + 2) * n_4 + 1);
++        B.s0123 = read_imagef(src1, gy * 2 + (i + 2) * n_4);
++        B.s4567 = read_imagef(src1, gy * 2 + (i + 2) * n_4 + 1);
+ 
+-        half4 wj2 = convert_half4((char4)(p0.s2, p1.s2, p2.s2, p3.s2)) * scale;
++        float4 wj2 = convert_float4((char4)(p0.s2, p1.s2, p2.s2, p3.s2)) * scale;
+ 
+         c0 += B * wj2.s0;
+         c1 += B * wj2.s1;
+@@ -82,10 +81,10 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
+         c3 += B * wj2.s3;
+ 
+         // ------------------- j = 3 (k = i+3) -------------------
+-        B.s0123 = read_imageh(src1, gy * 2 + (i + 3) * n_4);
+-        B.s4567 = read_imageh(src1, gy * 2 + (i + 3) * n_4 + 1);
++        B.s0123 = read_imagef(src1, gy * 2 + (i + 3) * n_4);
++        B.s4567 = read_imagef(src1, gy * 2 + (i + 3) * n_4 + 1);
+ 
+-        half4 wj3 = convert_half4((char4)(p0.s3, p1.s3, p2.s3, p3.s3)) * scale;
++        float4 wj3 = convert_float4((char4)(p0.s3, p1.s3, p2.s3, p3.s3)) * scale;
+ 
+         c0 += B * wj3.s0;
+         c1 += B * wj3.s1;
