@@ -1,33 +1,41 @@
-# LFM3-Omni speaks in real time on a Quest 3S
+# LFM3-Omni speaks in real time on a Quest 3S: +111% speed, +212% on battery
+
+![llama.cpp](https://img.shields.io/badge/llama.cpp-9f0e509-blue) ![Meta Quest 3S](https://img.shields.io/badge/Meta%20Quest-3S-black) ![LFM3-Omni-2B](https://img.shields.io/badge/LFM3--Omni-2B%20Q8__0-purple) ![real time](https://img.shields.io/badge/real%20time-1.17x-brightgreen) ![on battery](https://img.shields.io/badge/on%20battery-1.02x-brightgreen) ![OpenCL Adreno 740](https://img.shields.io/badge/OpenCL-Adreno%20740-orange) ![license MIT](https://img.shields.io/badge/license-MIT-lightgrey)
+
+`llama-cpp` `meta-quest` `quest-3s` `text-to-speech` `lfm` `liquid-ai` `on-device-ai` `opencl` `adreno` `snapdragon-xr2` `edge-ai` `vr`
 
 By **Adrian Ciprian Iancu** · [GitHub](https://github.com/ArtyomITA) · [Hugging Face](https://huggingface.co/adriandj3) · [LinkedIn](https://www.linkedin.com/in/adrian-ciprian-iancu-a2a477391)
 
-A 300 euro standalone headset, no cloud, no PC. Stock llama.cpp generates the voice of
-[LFM3-Omni-2B](https://huggingface.co/LiquidAI/LFM3-Omni-2B) at **0.56x real time** on the Quest 3S, so every
-sentence comes out late. With the patch in this repository it runs at **1.17x**, and it stays above 1.0x on battery.
+**A 300 euro VR headset now talks faster than you can listen. No cloud, no PC, no cable.**
 
-| | stock llama.cpp | this repo | |
+Out of the box, [LFM3-Omni-2B](https://huggingface.co/LiquidAI/LFM3-Omni-2B) on a Quest 3S needs 1.8 seconds to say
+one second of speech. With one patch to llama.cpp it needs 0.85. Same model file, same headset, same voice.
+
+| | stock llama.cpp | this repo | gain |
 |---|---|---|---|
-| plugged in | 143.5 ms per frame (0.56x) | **68.1 ms (1.17x)** | 2.1x faster |
-| on battery | 245.3 ms per frame (0.33x) | **78.5 ms (1.02x)** | 3.1x faster |
-| peak CPU memory | 4174 MB | **992 MB** | the weights live on the GPU |
+| speed, plugged in | 0.56x real time | **1.17x real time** | **+111%** |
+| speed, on battery | 0.33x real time | **1.02x real time** | **+212%** |
+| time per frame, plugged in | 143.5 ms | **68.1 ms** | **-53%** |
+| time per frame, on battery | 245.3 ms | **78.5 ms** | **-68%** |
+| peak CPU memory | 4174 MB | **992 MB** | **-76%** |
+| first launch after install | 53 s | **about 20 s** | **-62%** |
 
-One audio frame is 80 ms, so anything under 80 ms per frame is real time. The battery row uses the Q8-only patch.
+One audio frame is 80 ms, so anything under 80 ms per frame is real time. The battery rows use the Q8-only patch.
 Listen for yourself: [samples/](samples/) has the same sentences from stock and from this build, in English and Italian.
 
 ## Where the time went
 
 Snapdragon XR2 Gen 2, Adreno 740, 6 cores, Horizon OS, model in Q8_0, headset awake, 4 threads.
 
-| step | what changed | ms per frame | real time | audio |
-|---|---|---|---|---|
-| start | llama.cpp `9f0e509`, stock | 143.5 | 0.56x | reference |
-| 1 | MaskGIT schedule 6,6 in the depthformer | 130.0 | 0.62x | within the quality gates |
-| 2 | one shared thread pool, LM head skipped on audio frames, context sized for speech | 108.5 | 0.74x | bit-identical to step 1 |
-| 3 | backbone on the Adreno GPU through OpenCL, with an f32 fix in the Q8 kernel | 86.9 | 0.92x | within the quality gates |
-| 4 | depthformer weights repacked, only the heads that get sampled | 77.4 | 1.03x | within the quality gates |
-| 5 | codec on its own thread while the GPU works, last depthformer layer only on the rows it needs | 70.0 | 1.14x | bit-identical to step 4 |
-| 6 | depthformer feed-forward weights requantized to Q4 at load | **68.1** | **1.17x** | I listened: almost no difference |
+| step | what changed | ms per frame | real time | gain on stock | audio |
+|---|---|---|---|---|---|
+| start | llama.cpp `9f0e509`, stock | 143.5 | 0.56x | | reference |
+| 1 | MaskGIT schedule 6,6 in the depthformer | 130.0 | 0.62x | +10% | within the quality gates |
+| 2 | one shared thread pool, LM head skipped on audio frames, context sized for speech | 108.5 | 0.74x | +32% | bit-identical to step 1 |
+| 3 | backbone on the Adreno GPU through OpenCL, with an f32 fix in the Q8 kernel | 86.9 | 0.92x | +65% | within the quality gates |
+| 4 | depthformer weights repacked, only the heads that get sampled | 77.4 | 1.03x | +85% | within the quality gates |
+| 5 | codec on its own thread while the GPU works, last depthformer layer only on the rows it needs | 70.0 | 1.14x | +105% | bit-identical to step 4 |
+| 6 | depthformer feed-forward weights requantized to Q4 at load | **68.1** | **1.17x** | **+111%** | I listened: almost no difference |
 
 Per frame after step 6: backbone 50.7 ms on the GPU, depthformer 17.3 ms on the CPU, codec 0.1 ms on the critical path.
 
