@@ -1,0 +1,1481 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 69be4a6..cd092ed 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -2776,10 +2776,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
+         }
+     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+-    GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
+     add_opt(common_arg(
+         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
+-        string_format("max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: %s)", params.n_gpu_layers == -1 ? "auto" : "all"),
++        string_format("max. number of layers to store in VRAM, either an exact number, 'auto', or 'all' (default: %s)", params.n_gpu_layers == -1 ? "auto" : params.n_gpu_layers < -1 ? "all" : std::to_string(params.n_gpu_layers).c_str()), // harness voce-quest (prelude): default qualsiasi, assert tolto
+         [](common_params & params, const std::string & value) {
+             if (value == "auto") {
+                 params.n_gpu_layers = -1;
+diff --git a/common/common.h b/common/common.h
+index 84abddc..b83ab0b 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -479,7 +479,7 @@ struct common_params {
+     // offload params
+     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
+ 
+-    int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
++    int32_t n_gpu_layers       = 99;    // T10: backbone su GPU OpenCL di default (tts, perplexity, completion); mmproj resta su CPU (mmproj_use_gpu false)
+     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
+     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
+     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
+@@ -604,7 +604,7 @@ struct common_params {
+ 
+     // multimodal models (see tools/mtmd)
+     struct common_params_model mmproj;
+-    bool mmproj_use_gpu = true;                 // use GPU for multimodal model
++    bool mmproj_use_gpu = false;                // harness voce-quest (prelude): depthformer e codec su CPU di default
+     ggml_backend_dev_t mmproj_device = nullptr; // GPU device to use for multimodal model
+     bool no_mmproj = false;                     // explicitly disable multimodal model
+     std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 564fa9c..469956d 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -606,6 +606,11 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+     llama_synchronize(ctx);
+ 
++    // llama_set_no_logits: the LM head was skipped for this step, nothing to sample (the caller ignores the token)
++    if (llama_get_no_logits(ctx)) {
++        return 0;
++    }
++
+     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
+     const auto tm = gsmpl->tm();
+ 
+diff --git a/ggml/src/ggml-cpu/ggml-cpu-vq.h b/ggml/src/ggml-cpu/ggml-cpu-vq.h
+new file mode 100644
+index 0000000..3f47ea1
+--- /dev/null
++++ b/ggml/src/ggml-cpu/ggml-cpu-vq.h
+@@ -0,0 +1,92 @@
++#pragma once
++
++// VQS-BEGIN ggml-cpu-vq.h (contatori: la patch puo' cambiarli, eval stampa "contatori: modificati")
++// harness voce-quest (prelude, contratto v5): contatori per thread, attivi solo con VQ_CTR=1 nell'ambiente.
++// Un contatore per (pool, thread): pool 0 = persistente (llama, backbone), pool 1 = a perdere (creato e distrutto a ogni grafo: depthformer, codec).
++// Ogni contatore e' scritto solo dal suo thread (nessun atomico); il main legge gli snapshot a grafi fermi, tra un frame e l'altro.
++// Unita' di tempo: tick del contatore del processore (cntvct_el0 su arm64, hz in snapshot), nodo per nodo, mai dentro i pezzi di righe.
++
++#include <stdint.h>
++#include <time.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define GGML_VQ_NT   8      // thread contati per pool
++#define GGML_VQ_NF   12     // campi per contatore (vedi ggml_vq_field)
++
++enum ggml_vq_field {
++    GGML_VQ_ROWS,           // righe di peso lette nei pezzi presi da questo thread (generico, mul_mat_id, repack; llamafile: stima ne01/nth)
++    GGML_VQ_BYTES,          // byte di peso di quelle righe
++    GGML_VQ_WORK,           // tick dentro ggml_compute_forward, meno l'attesa alle barriere interne all'operazione
++    GGML_VQ_BARRIER,        // tick di attesa in ggml_barrier (ultimo arrivato: 0)
++    GGML_VQ_IDLE,           // tick in attesa di un nuovo grafo (thread secondari: poll + sonno)
++    GGML_VQ_STRAG,          // volte che questo thread e' arrivato ultimo a una barriera
++    GGML_VQ_STRAG_LATE,     // somma, su quelle volte, di (arrivo ultimo - arrivo primo) = quanto ha fatto aspettare gli altri
++    GGML_VQ_NODES,          // nodi calcolati
++    GGML_VQ_NBAR,           // barriere attraversate
++    GGML_VQ_GRAPHS,         // grafi cui ha partecipato
++    GGML_VQ_GRAPH_T,        // tick dentro ggml_graph_compute_thread (lavoro + barriere + giri)
++    GGML_VQ_SPARE,
++};
++
++struct ggml_vq_ctr {
++    uint64_t v[GGML_VQ_NF];
++    uint64_t arr;           // tick di arrivo all'ultima barriera
++    uint64_t pad[(128 - (GGML_VQ_NF + 1) * 8) / 8];
++} __attribute__((aligned(128)));
++
++struct ggml_vq_pool {
++    uint64_t graphs;        // chiamate a ggml_graph_compute
++    uint64_t graph_t;       // tick di muro in ggml_graph_compute (per i pool a perdere: creazione, calcolo, distruzione)
++    uint64_t pools;         // pool a perdere creati
++    uint64_t pool_t;        // tick per creare e distruggere i pool a perdere (thread create + join)
++};
++
++extern int                 ggml_vq_on;
++extern __thread struct ggml_vq_ctr * ggml_vq_cur;
++extern struct ggml_vq_ctr  ggml_vq_g[2][GGML_VQ_NT];
++extern struct ggml_vq_pool ggml_vq_p[2];
++
++static inline uint64_t ggml_vq_now(void) {
++#if defined(__aarch64__)
++    uint64_t t;
++    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t));
++    return t;
++#else
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
++#endif
++}
++
++// righe e byte di peso presi dal thread corrente; ctr nullo = contatori spenti
++#define GGML_VQ_ROWS_ADD(n, row_bytes) do { \
++        struct ggml_vq_ctr * vq_c_ = ggml_vq_cur; \
++        if (vq_c_) { vq_c_->v[GGML_VQ_ROWS] += (uint64_t) (n); vq_c_->v[GGML_VQ_BYTES] += (uint64_t) (n) * (uint64_t) (row_bytes); } \
++    } while (0)
++
++// copia dei contatori: ctr = [2][GGML_VQ_NT][GGML_VQ_NF], pool = [2][4], ritorna i tick al secondo
++uint64_t ggml_vq_snapshot(uint64_t * ctr, uint64_t * pool);
++
++#ifdef __cplusplus
++}
++#endif
++// VQS-END ggml-cpu-vq.h
++
++// VQ-BEGIN clock
++// microsecondi dal contatore del processore (cntvct_el0 / cntfrq_el0): l'orologio della metrica, mai ggml_time_us (sta fuori dal prelude)
++static inline int64_t ggml_vq_us(void) {
++#if defined(__aarch64__)
++    uint64_t t, f;
++    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t));
++    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
++    return (int64_t) ((t / f) * 1000000ull + (t % f) * 1000000ull / f);
++#else
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (int64_t) ts.tv_sec * 1000000 + (int64_t) ts.tv_nsec / 1000;
++#endif
++}
++// VQ-END clock
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index c2826fc..aff9ea9 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -15,6 +15,7 @@
+ #include "ggml.h"
+ #include "common.h"
+ #include "tiled/tiled.h"
++#include "ggml-cpu-vq.h" // VQS
+ 
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+ #include <malloc.h> // using malloc.h with MSC/MINGW
+@@ -511,6 +512,8 @@ struct ggml_threadpool {
+     uint32_t     poll;        // Polling level (0 - no polling)
+ 
+     enum ggml_status ec;
++
++    int vq_tag; // VQS: 0 = pool persistente, 1 = pool a perdere (creato dentro ggml_graph_compute)
+ };
+ 
+ // Per-thread state
+@@ -582,12 +585,44 @@ struct ggml_state {
+ 
+ static struct ggml_state g_state = {0};
+ 
++// VQS-BEGIN contatori
++int                 ggml_vq_on = 0;
++__thread struct ggml_vq_ctr * ggml_vq_cur = NULL;
++struct ggml_vq_ctr  ggml_vq_g[2][GGML_VQ_NT];
++struct ggml_vq_pool ggml_vq_p[2];
++
++static void __attribute__((constructor)) ggml_vq_ctor(void) {
++    const char * e = getenv("VQ_CTR");
++    ggml_vq_on = e && atoi(e) != 0;
++}
++
++uint64_t ggml_vq_snapshot(uint64_t * ctr, uint64_t * pool) {
++    for (int t = 0; t < 2; t++) {
++        for (int i = 0; i < GGML_VQ_NT; i++) {
++            memcpy(ctr + ((size_t) t * GGML_VQ_NT + i) * GGML_VQ_NF, ggml_vq_g[t][i].v, GGML_VQ_NF * sizeof(uint64_t));
++        }
++        memcpy(pool + (size_t) t * 4, &ggml_vq_p[t], sizeof(struct ggml_vq_pool));
++    }
++#if defined(__aarch64__)
++    uint64_t hz;
++    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
++    return hz;
++#else
++    return 1000000000ull;
++#endif
++}
++// VQS-END contatori
++
+ void ggml_barrier(struct ggml_threadpool * tp) {
+     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
+     if (n_threads == 1) {
+         return;
+     }
+ 
++    struct ggml_vq_ctr * vq = ggml_vq_cur; // VQS
++    uint64_t vq_t0 = 0;                    // VQS
++    if (vq) { vq_t0 = ggml_vq_now(); vq->arr = vq_t0; vq->v[GGML_VQ_NBAR]++; } // VQS
++
+ #ifdef GGML_USE_OPENMP
+     #pragma omp barrier
+ #else
+@@ -600,6 +635,16 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+         // last thread
+         atomic_store_explicit(&tp->n_barrier, 0, memory_order_relaxed);
+ 
++        if (vq) { // VQS-BEGIN ultimo arrivato: quanto ha fatto aspettare gli altri (il primo arrivato e' quello con arr minimo)
++            uint64_t first = vq_t0;
++            for (int i = 0; i < n_threads && i < GGML_VQ_NT; i++) {
++                const uint64_t a = ggml_vq_g[tp->vq_tag][i].arr;
++                if (a && a < first) { first = a; }
++            }
++            vq->v[GGML_VQ_STRAG]++;
++            vq->v[GGML_VQ_STRAG_LATE] += vq_t0 - first;
++        } // VQS-END
++
+         // exit barrier (full seq-cst fence)
+         atomic_fetch_add_explicit(&tp->n_barrier_passed, 1, memory_order_seq_cst);
+         return;
+@@ -609,6 +654,7 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+     while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
+         ggml_thread_cpu_relax();
+     }
++    if (vq) { vq->v[GGML_VQ_BARRIER] += ggml_vq_now() - vq_t0; } // VQS
+ 
+     // exit barrier (full seq-cst fence)
+     // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
+@@ -1329,6 +1375,7 @@ void ggml_compute_forward_mul_mat(
+                                      src1->type,
+                                      dst->type))
+                     goto UseGgmlGemm1;
++        GGML_VQ_ROWS_ADD(((ne01 + nth - 1) / nth) * ne12 * ne13, nb01); // VQS stima: llamafile divide le righe da solo
+         return;
+     }
+ UseGgmlGemm1:;
+@@ -1411,6 +1458,7 @@ UseGgmlGemm1:;
+                                      vec_dot_type,
+                                      dst->type))
+                     goto UseGgmlGemm2;
++        GGML_VQ_ROWS_ADD(((ne01 + nth - 1) / nth) * ne12 * ne13, nb01); // VQS stima: llamafile divide le righe da solo
+         return;
+     }
+ UseGgmlGemm2:;
+@@ -1471,6 +1519,7 @@ UseGgmlGemm2:;
+             num_rows_per_vec_dot = 1;
+         }
+         ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
++        GGML_VQ_ROWS_ADD(ir0_end - ir0_start, nb01); // VQS
+ 
+         if (nth >= nchunk0 * nchunk1) {
+             break;
+@@ -1739,6 +1788,7 @@ static void ggml_compute_forward_mul_mat_id(
+                 ir0_start, ir0_end, ir1_start, ir1_end,
+                 src0_cur, matrix_rows, row_size, src1_cont, wdata
+             );
++            GGML_VQ_ROWS_ADD(ir0_end - ir0_start, nb01); // VQS
+ 
+             if (nth >= nchunk0 * nchunk1) {
+                 break;
+@@ -2757,8 +2807,14 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
+     }
+ }
+ 
++// T4: pool condiviso dal backend CPU (ggml-cpu.cpp), azzerato in ggml_threadpool_free per non restare appeso a un pool liberato
++struct ggml_threadpool * ggml_backend_cpu_shared_tp = NULL;
++
+ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
+     if (!threadpool) return;
++    if (ggml_backend_cpu_shared_tp == threadpool) {
++        ggml_backend_cpu_shared_tp = NULL;
++    }
+ 
+     const int n_threads = threadpool->n_threads;
+ 
+@@ -3124,6 +3180,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     const struct ggml_cgraph * cgraph = tp->cgraph;
+     const struct ggml_cplan  * cplan  = tp->cplan;
+ 
++    struct ggml_vq_ctr * vq = (ggml_vq_on && state->ith < GGML_VQ_NT) ? &ggml_vq_g[tp->vq_tag][state->ith] : NULL; // VQS
++    ggml_vq_cur = vq;                                                                                             // VQS
++    const uint64_t vq_g0 = vq ? ggml_vq_now() : 0;                                                                // VQS
++
+ #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+     ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
+ #else
+@@ -3159,12 +3219,15 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
++        uint64_t vq_n0 = 0, vq_b0 = 0;                                  // VQS
++        if (vq) { vq_n0 = ggml_vq_now(); vq_b0 = vq->v[GGML_VQ_BARRIER]; } // VQS
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+         if (n_fused > 0) {
+             node_n += n_fused;
+         } else {
+             ggml_compute_forward(&params, node);
+         }
++        if (vq) { vq->v[GGML_VQ_WORK] += (ggml_vq_now() - vq_n0) - (vq->v[GGML_VQ_BARRIER] - vq_b0); vq->v[GGML_VQ_NODES]++; } // VQS
+ 
+         if (state->ith == 0 && cplan->abort_callback &&
+                 cplan->abort_callback(cplan->abort_callback_data)) {
+@@ -3185,6 +3248,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+     ggml_barrier(state->threadpool);
+ 
++    if (vq) { vq->v[GGML_VQ_GRAPHS]++; vq->v[GGML_VQ_GRAPH_T] += ggml_vq_now() - vq_g0; } // VQS
++
+ #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
+ #endif
+@@ -3285,7 +3350,9 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
+         // Check if there is new work
+         // The main thread is the only one that can dispatch new work
+ 
++        const uint64_t vq_i0 = (ggml_vq_on && state->ith < GGML_VQ_NT) ? ggml_vq_now() : 0; // VQS
+         ggml_graph_compute_check_for_work(state);
++        if (vq_i0) { ggml_vq_g[threadpool->vq_tag][state->ith].v[GGML_VQ_IDLE] += ggml_vq_now() - vq_i0; } // VQS
+         if (state->pending) {
+             state->pending = false;
+             ggml_graph_compute_thread(state);
+@@ -3352,6 +3419,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+         threadpool->poll             = tpp->poll;
+         threadpool->prio             = tpp->prio;
+         threadpool->ec               = GGML_STATUS_SUCCESS;
++        threadpool->vq_tag           = cgraph != NULL; // VQS: a perdere se creato da ggml_graph_compute
+     }
+ 
+     // Allocate and init workers state
+@@ -3418,6 +3486,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+     struct ggml_threadpool * threadpool = cplan->threadpool;
+ 
+     bool disposable_threadpool = false;
++    const uint64_t vq_w0 = ggml_vq_on ? ggml_vq_now() : 0; // VQS
+ 
+     if (threadpool == NULL) {
+         //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
+@@ -3425,6 +3494,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+ 
+         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
+         threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
++        if (vq_w0) { ggml_vq_p[1].pools++; ggml_vq_p[1].pool_t += ggml_vq_now() - vq_w0; } // VQS
+     } else {
+         // Reset some of the parameters that need resetting
+         // No worker threads should be accessing the parameters below at this stage
+@@ -3477,9 +3547,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+ 
+     enum ggml_status ret = threadpool->ec;
+ 
++    const int vq_tag = threadpool->vq_tag; // VQS
+     if (disposable_threadpool) {
++        const uint64_t vq_f0 = vq_w0 ? ggml_vq_now() : 0; // VQS
+         ggml_threadpool_free(threadpool);
++        if (vq_f0) { ggml_vq_p[1].pool_t += ggml_vq_now() - vq_f0; } // VQS
+     }
++    if (vq_w0) { ggml_vq_p[vq_tag].graphs++; ggml_vq_p[vq_tag].graph_t += ggml_vq_now() - vq_w0; } // VQS
+ 
+     return ret;
+ }
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 81ff5d7..7dd3cf7 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -167,10 +167,13 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
+     GGML_UNUSED(backend);
+ }
+ 
++// T4: ultimo pool attaccato (quello di llama), usato dai backend CPU senza pool (clip/mtmd) invece di un pool usa e getta per grafo; definito in ggml-cpu.c
++extern "C" struct ggml_threadpool * ggml_backend_cpu_shared_tp;
++
+ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+ 
+-    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
++    struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool ? cpu_ctx->threadpool : ggml_backend_cpu_shared_tp);
+ 
+     if (cpu_ctx->work_size < cplan.work_size) {
+         delete[] cpu_ctx->work_data;
+@@ -259,6 +262,9 @@ void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
+ 
+ void ggml_backend_cpu_set_threadpool(ggml_backend_t backend_cpu, ggml_threadpool_t threadpool) {
+     GGML_ASSERT(ggml_backend_is_cpu(backend_cpu));
++    if (threadpool) {
++        ggml_backend_cpu_shared_tp = threadpool;
++    }
+ 
+     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
+ 
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index 9282ca2..2b2fb04 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -6,6 +6,7 @@
+ #include "ggml-impl.h"
+ #include "ggml-cpu.h"
+ #include "ggml-cpu-impl.h"
++#include "ggml-cpu-vq.h" // VQS
+ #include "simd-mappings.h"
+ #include "traits.h"
+ 
+@@ -4775,6 +4776,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+             }
+ 
+             forward_mul_mat_one_chunk(params, dst, src0_start, src0_end, src1_start, src1_end);
++            GGML_VQ_ROWS_ADD(src0_end - src0_start, nb01); // VQS
+ 
+             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+         }
+diff --git a/ggml/src/ggml-opencl/kernels/gemm_noshuffle_q8_0_f32.cl b/ggml/src/ggml-opencl/kernels/gemm_noshuffle_q8_0_f32.cl
+index 7f06a22..f5a40ae 100644
+--- a/ggml/src/ggml-opencl/kernels/gemm_noshuffle_q8_0_f32.cl
++++ b/ggml/src/ggml-opencl/kernels/gemm_noshuffle_q8_0_f32.cl
+@@ -32,16 +32,15 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
+     dst  = (global float *)((global char*)dst  + offsetd);
+ 
+ 
+-    half8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+-    half8 B;
+-    half4 deq;
++    float8 c0 = 0, c1 = 0, c2 = 0, c3 = 0;
++    float8 B;
+ 
+     __global const uint* wptr = src0_q + gx_2;
+     __global const half* sptr = src0_d + gx_2;
+ 
+       for (int i = 0; i < k; i += 4) {
+         uint4 pack4 = vload4(0, wptr + (i / 4) * m);
+-        half4 scale = vload4(0, sptr + (i / 32) * m);
++        float4 scale = convert_float4(vload4(0, sptr + (i / 32) * m));
+ 
+         char4 p0 = as_char4(pack4.s0);
+         char4 p1 = as_char4(pack4.s1);
+@@ -49,10 +48,10 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
+         char4 p3 = as_char4(pack4.s3);
+ 
+         // ------------------- j = 0 (k = i+0) -------------------
+-        B.s0123 = read_imageh(src1, gy * 2 + (i + 0) * n_4);
+-        B.s4567 = read_imageh(src1, gy * 2 + (i + 0) * n_4 + 1);
++        B.s0123 = read_imagef(src1, gy * 2 + (i + 0) * n_4);
++        B.s4567 = read_imagef(src1, gy * 2 + (i + 0) * n_4 + 1);
+ 
+-        half4 wj0 = convert_half4((char4)(p0.s0, p1.s0, p2.s0, p3.s0)) * scale;
++        float4 wj0 = convert_float4((char4)(p0.s0, p1.s0, p2.s0, p3.s0)) * scale;
+ 
+         c0 += B * wj0.s0;
+         c1 += B * wj0.s1;
+@@ -60,10 +59,10 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
+         c3 += B * wj0.s3;
+ 
+         // ------------------- j = 1 (k = i+1) -------------------
+-        B.s0123 = read_imageh(src1, gy * 2 + (i + 1) * n_4);
+-        B.s4567 = read_imageh(src1, gy * 2 + (i + 1) * n_4 + 1);
++        B.s0123 = read_imagef(src1, gy * 2 + (i + 1) * n_4);
++        B.s4567 = read_imagef(src1, gy * 2 + (i + 1) * n_4 + 1);
+ 
+-        half4 wj1 = convert_half4((char4)(p0.s1, p1.s1, p2.s1, p3.s1)) * scale;
++        float4 wj1 = convert_float4((char4)(p0.s1, p1.s1, p2.s1, p3.s1)) * scale;
+ 
+         c0 += B * wj1.s0;
+         c1 += B * wj1.s1;
+@@ -71,10 +70,10 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
+         c3 += B * wj1.s3;
+ 
+         // ------------------- j = 2 (k = i+2) -------------------
+-        B.s0123 = read_imageh(src1, gy * 2 + (i + 2) * n_4);
+-        B.s4567 = read_imageh(src1, gy * 2 + (i + 2) * n_4 + 1);
++        B.s0123 = read_imagef(src1, gy * 2 + (i + 2) * n_4);
++        B.s4567 = read_imagef(src1, gy * 2 + (i + 2) * n_4 + 1);
+ 
+-        half4 wj2 = convert_half4((char4)(p0.s2, p1.s2, p2.s2, p3.s2)) * scale;
++        float4 wj2 = convert_float4((char4)(p0.s2, p1.s2, p2.s2, p3.s2)) * scale;
+ 
+         c0 += B * wj2.s0;
+         c1 += B * wj2.s1;
+@@ -82,10 +81,10 @@ kernel void kernel_gemm_noshuffle_q8_0_f32(
+         c3 += B * wj2.s3;
+ 
+         // ------------------- j = 3 (k = i+3) -------------------
+-        B.s0123 = read_imageh(src1, gy * 2 + (i + 3) * n_4);
+-        B.s4567 = read_imageh(src1, gy * 2 + (i + 3) * n_4 + 1);
++        B.s0123 = read_imagef(src1, gy * 2 + (i + 3) * n_4);
++        B.s4567 = read_imagef(src1, gy * 2 + (i + 3) * n_4 + 1);
+ 
+-        half4 wj3 = convert_half4((char4)(p0.s3, p1.s3, p2.s3, p3.s3)) * scale;
++        float4 wj3 = convert_float4((char4)(p0.s3, p1.s3, p2.s3, p3.s3)) * scale;
+ 
+         c0 += B * wj3.s0;
+         c1 += B * wj3.s1;
+diff --git a/include/llama.h b/include/llama.h
+index 428f51f..2f1438e 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1111,6 +1111,10 @@ extern "C" {
+     // TODO: rename to avoid confusion with llama_get_embeddings()
+     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
+ 
++    // Skip the LM head: the graph computes only the hidden state, llama_get_logits_ith() returns NULL (no re-reserve)
++    LLAMA_API void llama_set_no_logits(struct llama_context * ctx, bool no_logits);
++    LLAMA_API bool llama_get_no_logits(const struct llama_context * ctx);
++
+     // Set whether to use causal attention or not
+     // If set to true, the model will only attend to the past tokens
+     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index a450d82..13e4250 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1123,6 +1123,10 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
+ }
+ 
+ float * llama_context::get_logits_ith(int32_t i) {
++    if (cparams.no_logits) {
++        return nullptr; // the LM head was skipped, the buffer holds stale rows
++    }
++
+     output_reorder();
+ 
+     try {
+@@ -4472,6 +4476,14 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
+     ctx->set_embeddings(embeddings);
+ }
+ 
++void llama_set_no_logits(llama_context * ctx, bool no_logits) {
++    ctx->set_no_logits(no_logits);
++}
++
++bool llama_get_no_logits(const llama_context * ctx) {
++    return ctx->get_cparams().no_logits;
++}
++
+ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
+     ctx->set_causal_attn(causal_attn);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 39c5619..873a8f4 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -120,6 +120,7 @@ struct llama_context {
+     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
+ 
+     void set_embeddings (bool value);
++    void set_no_logits(bool value) { cparams.no_logits = value; }
+     void set_embeddings_nextn(bool value, bool masked);
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_embeddings_layer_inp_dev(bool value);
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 9d5fe2b..3c05371 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -35,6 +35,7 @@ struct llama_cparams {
+     bool embeddings;
+     bool embeddings_nextn;        // also extract the hidden state before the final output norm
+     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
++    bool no_logits = false;       // the graph skips the LM head, the caller reads only the hidden state
+     bool causal_attn;
+     bool offload_kqv;
+     bool flash_attn;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 9f99ba8..e0d26bf 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -4358,6 +4358,11 @@ void llm_graph_context::build_logits() const {
+         res->t_logits = nullptr;
+     }
+ 
++    // no_logits: the caller reads only the hidden state (pooling NONE embeddings output), the LM head is not computed
++    if (cparams.embeddings && cparams.no_logits) {
++        res->t_logits = nullptr;
++    }
++
+     // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
+     if (res->t_logits != nullptr) {
+         ggml_build_forward_expand(gf, res->t_logits);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 9867c95..dd8dcda 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -904,6 +904,7 @@ struct llm_graph_params {
+             cparams.embeddings              == other.cparams.embeddings              &&
+             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
++            cparams.no_logits               == other.cparams.no_logits               &&
+             cparams.causal_attn             == other.cparams.causal_attn             &&
+             layer_inp_dev == other.layer_inp_dev &&
+             layer_inp_src == other.layer_inp_src &&
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index 7ab36a9..a947297 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -8,6 +8,7 @@
+ #include "ggml-cpp.h"
+ #include "ggml-alloc.h"
+ #include "ggml-backend.h"
++#include "ggml-cpu.h"
+ #include "gguf.h"
+ 
+ #include <algorithm>
+@@ -158,6 +159,7 @@ struct clip_ctx {
+     ggml_backend_t backend = nullptr;
+     ggml_backend_t backend_cpu = nullptr;
+     ggml_backend_buffer_ptr buf;
++    ggml_backend_buffer_ptr buf_repack; // lfm3a_gen: depthformer weights repacked for the CPU gemm
+ 
+ 
+     int max_nodes = 8192;
+@@ -167,6 +169,11 @@ struct clip_ctx {
+ 
+     bool debug_output_embeddings = false;
+ 
++    // lfm3a_gen: the projected hidden state of the frame being sampled, and the hidden state it belongs to
++    std::vector<float> lfm3a_h;
++    ggml_threadpool_t tp_own = nullptr; // T21: pool CPU proprio dei grafi gen (il pool condiviso e' di llama: due grafi insieme sullo stesso pool si corrompono)
++    std::vector<float> lfm3a_proj;
++
+     // for measuring memory usage
+     bool no_alloc = false;
+     std::map<ggml_backend_dev_t, size_t> mem_usage;
+@@ -1228,6 +1235,8 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const
+                 const int64_t n_cb        = ctx->model.gen_code_embd_w->ne[2];
+                 bool all_known = false;
+                 int  n_frames  = 1;
++                std::vector<int> want;
++                bool proj_cached = false;
+                 if (params && params->codes) {
+                     GGML_ASSERT(params->codes->size() % (size_t) n_cb == 0);
+                     if (gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
+@@ -1236,9 +1245,19 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const
+                     } else {
+                         // -1 marks a masked codebook, none masked means only the feedback embedding is needed
+                         all_known = std::all_of(params->codes->begin(), params->codes->end(), [](int32_t c) { return c >= 0; });
++                        // -2 marks a masked codebook that this pass does not reveal: only the codebooks marked -1 get logits
++                        for (size_t i = 0; i < params->codes->size() && !all_known; i++) {
++                            if ((*params->codes)[i] == -1) {
++                                want.push_back((int) i);
++                            }
++                        }
++                        // the same hidden state as the pass that projected it
++                        const auto & h = img.get_ro_buf();
++                        proj_cached = !all_known && !ctx->lfm3a_proj.empty() && h.size() == ctx->lfm3a_h.size() &&
++                                      memcmp(h.data(), ctx->lfm3a_h.data(), h.size() * sizeof(float)) == 0;
+                     }
+                 }
+-                builder = std::make_unique<clip_graph_lfm3a_gen>(ctx, img, gen_process, all_known, n_frames);
++                builder = std::make_unique<clip_graph_lfm3a_gen>(ctx, img, gen_process, all_known, n_frames, want, proj_cached);
+             } break;
+         case PROJECTOR_TYPE_DRAMA3_GEN:
+             {
+@@ -4769,6 +4788,56 @@ struct clip_model_loader {
+ 
+             // alloc memory and offload data
+             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(ctx_clip.backend);
++            // T7: the depthformer weights (Q8_0, rows % 4) go to the CPU repack buffer like the backbone's: gemm 4x4 / 4x8 instead of the generic vec_dot.
++            // Tensors that already have a buffer are skipped by the allocation below.
++            if (model.proj_type == PROJECTOR_TYPE_LFM3A_GEN && !ctx_clip.no_alloc && ggml_backend_buft_is_host(buft)) {
++                ggml_backend_dev_t dev_cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++                ggml_backend_reg_t reg_cpu = dev_cpu ? ggml_backend_dev_backend_reg(dev_cpu) : nullptr;
++                auto fn_bufts = reg_cpu ? (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg_cpu, "ggml_backend_dev_get_extra_bufts") : nullptr;
++                auto fn_feats = reg_cpu ? (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg_cpu, "ggml_backend_get_features") : nullptr;
++                bool has_neon = false, has_int8 = false, has_dot = false; // the repack kernels exist only for these, as in repack.cpp
++                for (auto * f = fn_feats ? fn_feats(reg_cpu) : nullptr; f && f->name; f++) {
++                    has_neon |= strcmp(f->name, "NEON") == 0;
++                    has_int8 |= strcmp(f->name, "MATMUL_INT8") == 0;
++                    has_dot  |= strcmp(f->name, "DOTPROD") == 0;
++                }
++                ggml_backend_buffer_type_t buft_repack = nullptr;
++                for (auto * b = (fn_bufts && has_neon && (has_int8 || has_dot)) ? fn_bufts(dev_cpu) : nullptr; b && *b; b++) {
++                    if (strcmp(ggml_backend_buft_name(*b), "CPU_REPACK") == 0) {
++                        buft_repack = *b;
++                    }
++                }
++                if (buft_repack) {
++                    std::vector<ggml_tensor *> ws;
++                    auto add = [&](ggml_tensor * t) {
++                        if (t && t->type == GGML_TYPE_Q8_0 && ggml_n_dims(t) == 2 && t->ne[1] % 4 == 0) {
++                            ws.push_back(t);
++                        }
++                    };
++                    add(model.gen_code_proj_in_w);
++                    for (auto & l : model.layers) {
++                        add(l.q_w); add(l.k_w); add(l.v_w); add(l.o_w); add(l.attn_gate_w);
++                        add(l.ff_up_w); add(l.ff_gate_w); add(l.ff_down_w);
++                    }
++                    const size_t align = ggml_backend_buft_get_alignment(buft_repack);
++                    size_t size = 0;
++                    for (auto * t : ws) {
++                        size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft_repack, t), align);
++                    }
++                    if (size > 0) {
++                        ctx_clip.buf_repack.reset(ggml_backend_buft_alloc_buffer(buft_repack, size));
++                    }
++                    if (ctx_clip.buf_repack) {
++                        ggml_tallocr talloc = ggml_tallocr_new(ctx_clip.buf_repack.get());
++                        for (auto * t : ws) {
++                            ggml_tallocr_alloc(&talloc, t);
++                        }
++                        ggml_backend_buffer_set_usage(ctx_clip.buf_repack.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                        LOG_INF("%s: %zu depthformer weights in %s (%.2f MiB)\n", __func__, ws.size(),
++                                ggml_backend_buffer_name(ctx_clip.buf_repack.get()), size / 1024.0 / 1024.0);
++                    }
++                }
++            }
+             ctx_clip.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_clip.ctx_data.get(), buft));
+             ggml_backend_buffer_set_usage(ctx_clip.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+             // read the weight from file
+@@ -4785,7 +4854,7 @@ struct clip_model_loader {
+                         throw std::runtime_error(string_format("%s: failed to seek for tensor %s\n", __func__, t->name));
+                     }
+                     size_t num_bytes = ggml_nbytes(cur);
+-                    if (ggml_backend_buft_is_host(buft)) {
++                    if (ggml_backend_buffer_is_host(cur->buffer)) {
+                         // for the CPU and Metal backend, we can read directly into the tensor
+                         fin.read(reinterpret_cast<char *>(cur->data), num_bytes);
+                     } else {
+@@ -7010,6 +7079,19 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+                     if (ggml_graph_get_tensor(gf, "inp_mask") != nullptr) {
+                         set_input_f32("inp_mask", mask);
+                     }
++                    if (ggml_graph_get_tensor(gf, "inp_proj") != nullptr) {
++                        set_input_f32("inp_proj", ctx->lfm3a_proj);
++                    }
++                    if (ggml_graph_get_tensor(gf, "inp_want") != nullptr) {
++                        // the codebooks revealed by this pass, in order (-1 in the caller's codes)
++                        std::vector<int32_t> want;
++                        for (int64_t i = 0; i < n_cb; i++) {
++                            if ((*params->codes)[i] == -1) {
++                                want.push_back((int32_t) i);
++                            }
++                        }
++                        set_input_i32("inp_want", want);
++                    }
+                 }
+             } break;
+         case PROJECTOR_TYPE_DRAMA3_GEN:
+@@ -7580,7 +7662,21 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+     if (reg) {
+         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+         if (ggml_backend_set_n_threads_fn) {
+-            ggml_backend_set_n_threads_fn(ctx->backend_cpu, params->n_threads);
++            // T21: the codec runs next to the backbone decode: two cores less, they stay free for the thread that feeds the GPU
++            const bool wav = ctx->proj_type() == PROJECTOR_TYPE_LFM3A_GEN && params->gen_process == CLIP_GEN_PROCESS_GEN_WAV;
++            ggml_backend_set_n_threads_fn(ctx->backend_cpu, wav && params->n_threads > 2 ? params->n_threads - 2 : params->n_threads);
++        }
++        if (ctx->proj_type() == PROJECTOR_TYPE_LFM3A_GEN && !ctx->tp_own && params->n_threads > 1) {
++            // shortcut: the pool is never freed (workers sleep until the process ends), free it with the context if clips are ever reloaded
++            auto fn_new = (decltype(ggml_threadpool_new) *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
++            auto fn_set = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
++            if (fn_new && fn_set) {
++                ggml_threadpool_params tpp = ggml_threadpool_params_default(params->n_threads);
++                ctx->tp_own = fn_new(&tpp);
++                if (ctx->tp_own) {
++                    fn_set(ctx->backend_cpu, ctx->tp_own);
++                }
++            }
+         }
+     }
+ 
+@@ -7590,6 +7686,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+         return false;
+     }
+ 
++    if (ggml_tensor * proj = ggml_graph_get_tensor(gf, "out_proj")) { // lfm3a_gen: kept for the next pass of the frame
++        ctx->lfm3a_proj.resize(ggml_nelements(proj));
++        ggml_backend_tensor_get(proj, ctx->lfm3a_proj.data(), 0, ggml_nbytes(proj));
++        ctx->lfm3a_h = imgs.entries[0].get_ro_buf();
++    }
++
+     if (embeddings != nullptr) {
+         // sanity check (assuming that all images in batch have the same number of tokens, so we only check the first one)
+         const int n_tokens_out = embeddings->ne[1];
+diff --git a/tools/mtmd/models/lfm3a-gen.cpp b/tools/mtmd/models/lfm3a-gen.cpp
+index 9986057..9a9b2bb 100644
+--- a/tools/mtmd/models/lfm3a-gen.cpp
++++ b/tools/mtmd/models/lfm3a-gen.cpp
+@@ -30,13 +30,14 @@ std::vector<c2w_state_slot> list_lfm3a_gen_state_slots(const clip_hparams & hpar
+ 
+ // pre-norm LFM block, with the LFM3 sandwich norms when the layer has them
+ ggml_tensor * clip_graph_lfm3a_gen::build_lfm_layer(ggml_tensor * inpL, const clip_layer & layer, float eps, int il,
+-                                                    const std::function<ggml_tensor *(ggml_tensor *)> & op) {
++                                                    const std::function<ggml_tensor *(ggml_tensor *)> & op, ggml_tensor * rows) {
+     ggml_tensor * cur = build_norm(inpL, layer.ln_1_w, nullptr, NORM_TYPE_RMS, eps, il);
+     cur = op(cur);
+     if (layer.attn_post_norm_w) {
+         cur = build_norm(cur, layer.attn_post_norm_w, nullptr, NORM_TYPE_RMS, eps, il);
+     }
+-    inpL = ggml_add(ctx0, cur, inpL);
++    // rows: op returned only these rows, the rest of the layer is for them alone
++    inpL = ggml_add(ctx0, cur, rows ? ggml_get_rows(ctx0, inpL, rows) : inpL);
+ 
+     cur = build_norm(inpL, layer.ln_2_w, nullptr, NORM_TYPE_RMS, eps, il);
+     cur = build_ffn(cur, layer.ff_up_w, nullptr, layer.ff_gate_w, nullptr, layer.ff_down_w, nullptr, FFN_SILU, il);
+@@ -50,17 +51,21 @@ ggml_tensor * clip_graph_lfm3a_gen::build_lfm_layer(ggml_tensor * inpL, const cl
+ ggml_tensor * clip_graph_lfm3a_gen::build_lfm_attn(ggml_tensor * cur, const clip_layer & layer, int n_head, int n_head_kv,
+                                                    float eps, float rope_theta, int il, ggml_tensor * inp_pos,
+                                                    ggml_tensor * kq_mask, ggml_tensor * k_cache, ggml_tensor * v_cache,
+-                                                   ggml_tensor ** k_all, ggml_tensor ** v_all) {
++                                                   ggml_tensor ** k_all, ggml_tensor ** v_all, ggml_tensor * rows) {
+     const int64_t n_pos   = cur->ne[1];
+     const int64_t head_dim = layer.q_norm->ne[0];
+ 
+-    ggml_tensor * Qcur = ggml_reshape_3d(ctx0, build_mm(layer.q_w, cur), head_dim, n_head,    n_pos);
++    // rows: queries (and gate) for these positions only, keys and values for all
++    ggml_tensor * xq  = rows ? ggml_get_rows(ctx0, cur, rows) : cur;
++    const int64_t n_q = xq->ne[1];
++
++    ggml_tensor * Qcur = ggml_reshape_3d(ctx0, build_mm(layer.q_w, xq), head_dim, n_head,    n_q);
+     ggml_tensor * Kcur = ggml_reshape_3d(ctx0, build_mm(layer.k_w, cur), head_dim, n_head_kv, n_pos);
+     ggml_tensor * Vcur = build_mm(layer.v_w, cur);
+ 
+     Qcur = build_norm(Qcur, layer.q_norm, nullptr, NORM_TYPE_RMS, eps, il);
+     Kcur = build_norm(Kcur, layer.k_norm, nullptr, NORM_TYPE_RMS, eps, il);
+-    Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, head_dim, GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
++    Qcur = ggml_rope_ext(ctx0, Qcur, rows ? rows : inp_pos, nullptr, head_dim, GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+     Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, head_dim, GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+ 
+     ggml_tensor * k = ggml_reshape_2d(ctx0, Kcur, head_dim * n_head_kv, n_pos);
+@@ -81,9 +86,9 @@ ggml_tensor * clip_graph_lfm3a_gen::build_lfm_attn(ggml_tensor * cur, const clip
+         ggml_reshape_3d(ctx0, v, head_dim, n_head_kv, n_kv),
+         kq_mask, 1.0f / sqrtf((float) head_dim), il);
+     if (layer.attn_gate_w) {
+-        ggml_tensor * gate = ggml_sigmoid(ctx0, build_mm(layer.attn_gate_w, cur));
+-        attn = ggml_mul(ctx0, ggml_reshape_3d(ctx0, attn, head_dim, n_head, n_pos), ggml_reshape_3d(ctx0, gate, 1, n_head, n_pos));
+-        attn = build_mm(layer.o_w, ggml_reshape_2d(ctx0, attn, head_dim * n_head, n_pos));
++        ggml_tensor * gate = ggml_sigmoid(ctx0, build_mm(layer.attn_gate_w, xq));
++        attn = ggml_mul(ctx0, ggml_reshape_3d(ctx0, attn, head_dim, n_head, n_q), ggml_reshape_3d(ctx0, gate, 1, n_head, n_q));
++        attn = build_mm(layer.o_w, ggml_reshape_2d(ctx0, attn, head_dim * n_head, n_q));
+     }
+     return attn;
+ }
+@@ -129,17 +134,27 @@ ggml_tensor * clip_graph_lfm3a_gen::build_gen_code() {
+         return fb;
+     }
+ 
+-    ggml_tensor * h_state = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_mmproj_embd);
+-    ggml_set_name(h_state, "inp_raw");
+-    ggml_set_input(h_state);
+-
+     // 1 for a revealed codebook, 0 for a masked one
+     ggml_tensor * inp_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_cb);
+     ggml_set_name(inp_mask, "inp_mask");
+     ggml_set_input(inp_mask);
+ 
+     // one position per codebook: projected hidden state + token embedding or the mask embedding
+-    ggml_tensor * cur = ggml_add(ctx0, build_mm(model.gen_code_proj_in_w, h_state), model.gen_code_proj_in_b);
++    // the projection is the same in every pass of a frame: the first pass hands it to the host, the next ones take it as input
++    ggml_tensor * cur = nullptr;
++    if (proj_cached) {
++        cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_embd * n_cb);
++        ggml_set_name(cur, "inp_proj");
++        ggml_set_input(cur);
++    } else {
++        ggml_tensor * h_state = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_mmproj_embd);
++        ggml_set_name(h_state, "inp_raw");
++        ggml_set_input(h_state);
++        cur = ggml_add(ctx0, build_mm(model.gen_code_proj_in_w, h_state), model.gen_code_proj_in_b);
++        ggml_set_name(cur, "out_proj");
++        ggml_set_output(cur);
++        ggml_build_forward_expand(gf, cur);
++    }
+     cur = ggml_reshape_2d(ctx0, cur, n_embd, n_cb);
+ 
+     ggml_tensor * tok = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, embd_w, n_embd, n_vocab * n_cb), inp_codes);
+@@ -150,18 +165,39 @@ ggml_tensor * clip_graph_lfm3a_gen::build_gen_code() {
+ 
+     // bidirectional: no mask, no state
+     ggml_tensor * inp_pos = ggml_cast(ctx0, ggml_arange(ctx0, 0.0f, (float) n_cb, 1.0f), GGML_TYPE_I32);
++    // the logits come from the codebooks of this pass only: the last layer works on those rows (= their positions)
++    ggml_tensor * rows = nullptr;
++    if (!want.empty()) {
++        rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) want.size());
++        ggml_set_name(rows, "inp_want");
++        ggml_set_input(rows);
++    }
+     for (int il = 0; il < n_layer; il++) {
+         const auto & layer = model.layers[il];
++        ggml_tensor * last = il == n_layer - 1 ? rows : nullptr;
+         cur = build_lfm_layer(cur, layer, eps, il, [&](ggml_tensor * x) {
+             return build_lfm_attn(x, layer, hparams.n_head, hparams.n_head_kv, eps, hparams.rope_theta, il, inp_pos,
+-                                  nullptr, nullptr, nullptr, nullptr, nullptr);
+-        });
++                                  nullptr, nullptr, nullptr, nullptr, nullptr, last);
++        }, last);
+     }
+ 
+     cur = build_norm(cur, model.gen_code_norm_w, nullptr, NORM_TYPE_RMS, eps, -1);
+-    cur = build_norm(cur, model.gen_code_head_norm_w, nullptr, NORM_TYPE_RMS, eps, -1); // per codebook
+-    ggml_tensor * logits = ggml_mul_mat(ctx0, embd_w, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_cb)); // [n_vocab, 1, n_cb]
+-    logits = ggml_reshape_2d(ctx0, logits, n_vocab, n_cb);
++    cur = build_norm(cur, rows ? ggml_get_rows(ctx0, model.gen_code_head_norm_w, rows) : model.gen_code_head_norm_w,
++                     nullptr, NORM_TYPE_RMS, eps, -1); // per codebook
++    ggml_tensor * logits = nullptr;
++    if (want.empty()) {
++        logits = ggml_mul_mat(ctx0, embd_w, ggml_reshape_3d(ctx0, cur, n_embd, 1, n_cb)); // [n_vocab, 1, n_cb]
++        logits = ggml_reshape_2d(ctx0, logits, n_vocab, n_cb);
++    } else {
++        // one head per codebook of the pass, in codebook order: [n_vocab, want.size()]
++        size_t k = 0;
++        for (int w : want) {
++            ggml_tensor * head = ggml_view_2d(ctx0, embd_w, embd_w->ne[0], n_vocab, embd_w->nb[1], (size_t) w * embd_w->nb[2]);
++            ggml_tensor * x    = ggml_view_2d(ctx0, cur, n_embd, 1, cur->nb[1], k++ * cur->nb[1]); // row k of the pass
++            ggml_tensor * l    = ggml_mul_mat(ctx0, head, x);
++            logits = logits ? ggml_concat(ctx0, logits, l, 1) : l;
++        }
++    }
+     ggml_set_name(logits, "out_feats");
+     ggml_set_output(logits);
+     ggml_build_forward_expand(gf, logits);
+diff --git a/tools/mtmd/models/models.h b/tools/mtmd/models/models.h
+index 8487a00..cb0339a 100644
+--- a/tools/mtmd/models/models.h
++++ b/tools/mtmd/models/models.h
+@@ -547,23 +547,26 @@ struct clip_graph_soprano : clip_graph {
+ // GEN_WAV  = liquid-codec decoder, a window of frames -> polar STFT frames
+ //
+ struct clip_graph_lfm3a_gen : clip_graph {
+-    clip_graph_lfm3a_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, bool all_known, int n_frames)
+-        : clip_graph(ctx, img), gen_process(gen_process), all_known(all_known), n_frames(n_frames) {}
++    clip_graph_lfm3a_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, bool all_known, int n_frames,
++                         const std::vector<int> & want, bool proj_cached)
++        : clip_graph(ctx, img), gen_process(gen_process), all_known(all_known), n_frames(n_frames), want(want), proj_cached(proj_cached) {}
+     ggml_cgraph * build() override;
+ 
+     clip_gen_process_type gen_process;
+     bool all_known; // GEN_CODE only
+     int  n_frames;  // GEN_WAV only
++    std::vector<int> want; // GEN_CODE only: the codebooks of this pass, the only ones with logits (empty: all)
++    bool proj_cached;      // GEN_CODE only: the projected hidden state of the frame comes from the previous pass
+ 
+     ggml_tensor * build_gen_code();
+     ggml_tensor * build_gen_wav();
+ 
+     ggml_tensor * build_lfm_layer(ggml_tensor * inpL, const clip_layer & layer, float eps, int il,
+-                                  const std::function<ggml_tensor *(ggml_tensor *)> & op);
++                                  const std::function<ggml_tensor *(ggml_tensor *)> & op, ggml_tensor * rows = nullptr);
+     ggml_tensor * build_lfm_attn(ggml_tensor * cur, const clip_layer & layer, int n_head, int n_head_kv,
+                                  float eps, float rope_theta, int il, ggml_tensor * inp_pos,
+                                  ggml_tensor * kq_mask, ggml_tensor * k_cache, ggml_tensor * v_cache,
+-                                 ggml_tensor ** k_all, ggml_tensor ** v_all);
++                                 ggml_tensor ** k_all, ggml_tensor ** v_all, ggml_tensor * rows = nullptr);
+     ggml_tensor * build_lfm_conv(ggml_tensor * cur, const clip_layer & layer, int il,
+                                  ggml_tensor * conv_state, ggml_tensor ** conv_state_out);
+ };
+diff --git a/tools/mtmd/mtmd-helper-gen.cpp b/tools/mtmd/mtmd-helper-gen.cpp
+index d776ed1..f89baa3 100644
+--- a/tools/mtmd/mtmd-helper-gen.cpp
++++ b/tools/mtmd/mtmd-helper-gen.cpp
+@@ -12,6 +12,7 @@
+ #include <memory>
+ #include <random>
+ #include <string>
++#include <thread>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -19,6 +20,25 @@
+ #error "mtmd-helper is a public library outside of mtmd. it must not include internal headers"
+ #endif
+ 
++// VQ-BEGIN registratore (prelude harness voce-quest, contratto v5): i codici di ogni frame e i microsecondi per stadio
++// orologio proprio (cntvct_el0 / cntfrq_el0), lo stesso di ggml-cpu-vq.h: la libreria mtmd non include header interni
++static inline int64_t ggml_vq_us(void) {
++#if defined(__aarch64__)
++    uint64_t t, f;
++    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t));
++    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
++    return (int64_t) ((t / f) * 1000000ull + (t % f) * 1000000ull / f);
++#else
++#error "VQ: orologio solo arm64"
++#endif
++}
++// stadi: 0 depthformer (campionamento + embedding di ritorno), 1 codec (decode_wav), 2 backbone (llama_process), 3 riservato
++static struct { std::vector<int32_t> codes; int64_t stage_us[4]; } g_vq_rec;
++extern "C" const int32_t * mtmd_helper_vq_codes(size_t * n) { *n = g_vq_rec.codes.size(); return g_vq_rec.codes.data(); }
++extern "C" const int64_t * mtmd_helper_vq_stage_us(void)    { return g_vq_rec.stage_us; }
++extern "C" void            mtmd_helper_vq_clear(void)       { g_vq_rec.codes.clear(); }
++// VQ-END
++
+ //
+ // Audio generation helpers
+ //
+@@ -1259,6 +1279,9 @@ public:
+         audio_pcm.clear();
+         h_state_buf.clear();
+         out_buf.clear();
++        if (lctx) {
++            llama_set_no_logits(lctx, false); // the prompt and the text slots need the LM head
++        }
+     }
+ 
+     int32_t set_input(const mtmd_helper_gen_audio_inp * inp) override {
+@@ -1384,11 +1407,14 @@ public:
+             }
+         } else {
+             std::vector<int32_t> codes;
++            wav_job wav; // after codes: joins before they are freed on every return
+             const float * fb = nullptr;
+             bool is_eos = false;
++            const int64_t vq_a = ggml_vq_us(); // VQS
+             if (!sample_frame(h_state_in, codes, &fb, &is_eos)) {
+                 return 1;
+             }
++            g_vq_rec.stage_us[0] += ggml_vq_us() - vq_a; // VQS
+             if (is_eos) {
+                 if (!continuing) {
+                     // TTS: the end of audio ends the generation
+@@ -1403,17 +1429,32 @@ public:
+                 mode = MODE_TEXT;
+             } else {
+                 hist.insert(hist.end(), codes.begin(), codes.end());
+-                if (!decode_wav(codes.data(), codes.size())) {
+-                    return 1;
+-                }
++                g_vq_rec.codes.insert(g_vq_rec.codes.end(), codes.begin(), codes.end()); // VQ
++                const int64_t vq_b = ggml_vq_us(); // VQS
++                // T21: the backbone below needs fb, not the PCM: the codec of this frame runs while the GPU decodes, joined before returning
++                wav.t = std::thread([this, &wav, &codes] { wav.ok = decode_wav(codes.data(), codes.size()); });
++                g_vq_rec.stage_us[1] += ggml_vq_us() - vq_b; // VQS
+             }
+             decode_embd_batch batch_embd(const_cast<float *>(fb), 1, 1, n_embd);
+             batch_embd.set_position_normal(pos, seq_id);
+             batch_embd.logits[0] = 1;
++            // the LM head (text logits) is needed only when the next slot is text: after an audio frame followed by audio only the hidden state is read
++            const bool speaks_next = interleaving && !text_done && slots_left == 1 ? !speaking : speaking;
++            llama_set_no_logits(lctx, !(mode == MODE_TEXT || (mode == MODE_MIXED && !speaks_next)));
++            const int64_t vq_c = ggml_vq_us(); // VQS
+             if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch_embd.render(lctx, 0, 1)) != 0) {
+                 LOG_ERR("mtmd_helper_gen_audio: decode failed\n");
+                 return 1;
+             }
++            g_vq_rec.stage_us[2] += ggml_vq_us() - vq_c; // VQS
++            const int64_t vq_j = ggml_vq_us();
++            if (wav.t.joinable()) {
++                wav.t.join();
++            }
++            g_vq_rec.stage_us[1] += ggml_vq_us() - vq_j; // the part of the codec not hidden by the backbone
++            if (!wav.ok) {
++                return 1;
++            }
+             pos++;
+         }
+ 
+@@ -1489,9 +1530,15 @@ public:
+     }
+ 
+ private:
++    struct wav_job {
++        std::thread t;
++        bool ok = true;
++        ~wav_job() { if (t.joinable()) { t.join(); } }
++    };
++
+     // checked by the converter
+     static constexpr int   n_cb        = 12;
+-    static constexpr int   schedule[]  = { 4, 4, 4 }; // codebooks revealed per depthformer pass
++    static constexpr int   schedule[]  = { 6, 6 }; // codebooks revealed per depthformer pass
+ 
+     // a random order of the codebooks, revealed by the schedule; fb is the feedback embedding of the codes.
+     // at the end of audio every code is the end code, its feedback embedding is only built when continuing
+@@ -1502,7 +1549,7 @@ private:
+         }
+         std::shuffle(order.begin(), order.end(), rng);
+ 
+-        codes.assign(n_cb, -1);
++        codes.assign(n_cb, -2); // -2: masked, not revealed by the pass; -1: masked, revealed by it (only these get logits)
+         mtmd_gen_inp inp = mtmd_gen_inp_default(mctx);
+         inp.type    = MTMD_GEN_PROCESS_TYPE_GEN_CODE;
+         inp.embd    = const_cast<float *>(h_state);
+@@ -1510,24 +1557,33 @@ private:
+         inp.n_codes = codes.size();
+         mtmd_gen_out out{};
+ 
+-        int k = 0;
++        int    k       = 0;
++        size_t n_vocab = 0;
+         for (int n_pick : schedule) {
+-            if (mtmd_gen_audio_process(mctx, gen_state.get(), &inp, &out) != 0 || out.n_feats == 0 || out.n_feats % n_cb != 0) {
++            for (int j = 0; j < n_pick; j++) {
++                codes[(size_t) order[(size_t) (k + j)]] = -1;
++            }
++            if (mtmd_gen_audio_process(mctx, gen_state.get(), &inp, &out) != 0 || out.n_feats == 0 || out.n_feats % n_pick != 0) {
+                 LOG_ERR("mtmd_helper_gen_audio: depthformer pass failed\n");
+                 return false;
+             }
+-            const size_t n_vocab = out.n_feats / n_cb;
++            n_vocab = out.n_feats / n_pick;
+             logits.assign(out.feats, out.feats + out.n_feats);
++            const int k0 = k;
+             for (int j = 0; j < n_pick; j++, k++) {
+                 const int i = order[(size_t) k];
+-                float * l = logits.data() + (size_t) i * n_vocab;
++                int rank = 0; // the logits of the pass come in codebook order
++                for (int jj = 0; jj < n_pick; jj++) {
++                    rank += order[(size_t) (k0 + jj)] < i;
++                }
++                float * l = logits.data() + (size_t) rank * n_vocab;
+                 apply_rep_penalty(l, n_vocab, i);
+                 codes[(size_t) i] = sample(l, n_vocab);
+             }
+         }
+ 
+         // the last code of every codebook ends the audio
+-        const int32_t eos = (int32_t) (logits.size() / n_cb) - 1;
++        const int32_t eos = (int32_t) n_vocab - 1;
+         *is_eos = std::find(codes.begin(), codes.end(), eos) != codes.end();
+         if (*is_eos) {
+             codes.assign(n_cb, eos);
+diff --git a/tools/mtmd/mtmd-helper.h b/tools/mtmd/mtmd-helper.h
+index a9ffdf7..d3e11a2 100644
+--- a/tools/mtmd/mtmd-helper.h
++++ b/tools/mtmd/mtmd-helper.h
+@@ -311,6 +311,12 @@ MTMD_API int32_t mtmd_helper_gen_audio_get_output(
+ // call once when generation has ended, before the last get_output() in stream mode
+ MTMD_API int32_t mtmd_helper_gen_audio_flush(mtmd_helper_gen_audio * ctx);
+ 
++// VQ-BEGIN harness voce-quest (prelude): codici (12 per frame) e microsecondi cumulati per stadio, vedi mtmd-helper-gen.cpp
++MTMD_API const int32_t * mtmd_helper_vq_codes(size_t * n);
++MTMD_API const int64_t * mtmd_helper_vq_stage_us(void); // 4 valori: depthformer, codec, backbone, riservato
++MTMD_API void            mtmd_helper_vq_clear(void);
++// VQ-END
++
+ #ifdef __cplusplus
+ } // extern "C"
+ #endif
+diff --git a/tools/tts/tts.cpp b/tools/tts/tts.cpp
+index 8578f88..b917360 100644
+--- a/tools/tts/tts.cpp
++++ b/tools/tts/tts.cpp
+@@ -11,6 +11,8 @@
+ #include <cstring>
+ #include <string>
+ 
++#include "vq.h" // VQ
++
+ /**
+  * Please note that this is NOT a production-ready binary.
+  * It is a playground for trying TTS support in llama.cpp.
+@@ -68,6 +70,10 @@ int main(int argc, char ** argv) {
+ 
+     // always enable embd, so that we can pass hidden states to the audio generation helper
+     params.embedding = true;
++    // T2: contesto sulla misura della frase (max 512 frame + prompt); 0 = n_ctx_train 128000, KV da 1,5 GB
++    if (params.n_ctx == 0) {
++        params.n_ctx = 2048;
++    }
+ 
+     llama_backend_init();
+     llama_numa_init(params.numa);
+@@ -88,6 +94,7 @@ int main(int argc, char ** argv) {
+     mtmd_context_params mtmd_params = mtmd_context_params_default();
+     mtmd_params.use_gpu = params.mmproj_use_gpu;
+     mtmd_params.device  = params.mmproj_device;
++    mtmd_params.n_threads = params.cpuparams.n_threads; // T4: stesso numero di thread del pool condiviso con llama
+     mtmd::context_ptr mctx(mtmd_init_from_file(params.mmproj.path.c_str(), model, mtmd_params));
+     if (!mctx) {
+         LOG_ERR("failed to load mmproj %s\n", params.mmproj.path.c_str());
+@@ -152,6 +159,12 @@ int main(int argc, char ** argv) {
+     inp.top_p       = params.sampling.top_p;
+     inp.seed        = params.sampling.seed;
+ 
++    // VQ-BEGIN modo batch (contratto v5), vedi vq.h
++    if (const char * vq_manifest = getenv("VQ_BATCH")) {
++        return vq_batch_run(params, lctx, smpl, tmpls.get(), speaker_bitmap.get(), gen, vq_manifest);
++    }
++    // VQ-END
++
+     //
+     // stage 1: process prompt via backbone model, generate semantic representation
+     //
+diff --git a/tools/tts/vq.h b/tools/tts/vq.h
+new file mode 100644
+index 0000000..4e8b1df
+--- /dev/null
++++ b/tools/tts/vq.h
+@@ -0,0 +1,293 @@
++#pragma once
++
++// VQ-BEGIN vq.h
++// harness voce-quest (prelude, contratto v5): modo batch di llama-tts. Uguale per base e patch, mai in kernel.patch.
++//   VQ_BATCH=<manifest>  una riga per sintesi: nome<TAB>file_testo[<TAB>w]  (w = riscaldamento, non misurata)
++//   VQ_OUT=<prefisso>    scrive <prefisso><nome>.wav, <prefisso><nome>.codes (int32 LE, 12 per frame) e accoda <prefisso>vq.jsonl
++//   VQ_CTR=1             contatori per thread dentro ggml-cpu (ggml-cpu-vq.h)
++//   VQ_SYS=<f1:f2:...>   file di sistema letti prima e dopo ogni sintesi (testo grezzo nel json)
++//   VQ_TASKS=1           /proc/self/task/*/{comm,schedstat} prima e dopo (tempo in coda di esecuzione per thread)
++//   VQ_CLEAR_DATA=1      azzera anche i dati della KV tra una frase e l'altra (default: solo i metadati)
++// Ogni sintesi riparte da zero: KV svuotata, sampler azzerato (seme), stato del codec e rng del MaskGIT rifatti da set_input.
++// Il testo si legge come -f (un solo \n finale tolto). Il programma non calcola hash: li calcola il PC sui file tirati dal visore.
++
++#include "../../ggml/src/ggml-cpu/ggml-cpu-vq.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <vector>
++#ifdef __linux__
++#include <dirent.h>
++#endif
++
++static std::string vq_read(const std::string & path) {
++    std::string out;
++    FILE * f = fopen(path.c_str(), "rb");
++    if (!f) {
++        return out;
++    }
++    char buf[4096];
++    size_t n;
++    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
++        out.append(buf, n);
++    }
++    fclose(f);
++    return out;
++}
++
++static std::string vq_json(const std::string & s) {
++    std::string o = "\"";
++    for (unsigned char c : s) {
++        if (c == '"' || c == '\\') { o += '\\'; o += (char) c; }
++        else if (c == '\n') { o += "\\n"; }
++        else if (c == '\t') { o += "\\t"; }
++        else if (c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); o += b; }
++        else { o += (char) c; }
++    }
++    return o + "\"";
++}
++
++static std::string vq_tasks() {
++    std::string o;
++#ifdef __linux__
++    if (DIR * d = opendir("/proc/self/task")) {
++        while (dirent * e = readdir(d)) {
++            if (e->d_name[0] < '0' || e->d_name[0] > '9') {
++                continue;
++            }
++            std::string base = std::string("/proc/self/task/") + e->d_name;
++            std::string comm = vq_read(base + "/comm");
++            while (!comm.empty() && (comm.back() == '\n' || comm.back() == ' ')) { comm.pop_back(); }
++            std::string ss = vq_read(base + "/schedstat");
++            while (!ss.empty() && ss.back() == '\n') { ss.pop_back(); }
++            o += std::string(e->d_name) + " " + comm + " " + ss + "\n";
++        }
++        closedir(d);
++    }
++#endif
++    return o;
++}
++
++static std::string vq_sys(const std::vector<std::string> & files, bool tasks) {
++    std::string o = "{";
++    bool first = true;
++    for (const auto & f : files) {
++        o += std::string(first ? "" : ",") + vq_json(f) + ":" + vq_json(vq_read(f));
++        first = false;
++    }
++    if (tasks) {
++        o += std::string(first ? "" : ",") + "\"tasks\":" + vq_json(vq_tasks());
++    }
++    return o + "}";
++}
++
++// snapshot dei contatori ggml: [2][GGML_VQ_NT][GGML_VQ_NF] + pool [2][4], come array json piatto
++static std::string vq_ctr_json(uint64_t * hz) {
++    static uint64_t ctr[2 * GGML_VQ_NT * GGML_VQ_NF], pool[8];
++    *hz = ggml_vq_snapshot(ctr, pool);
++    std::string o = "[";
++    for (int i = 0; i < 2 * GGML_VQ_NT * GGML_VQ_NF; i++) { o += std::to_string(ctr[i]) + ","; }
++    for (int i = 0; i < 8; i++) { o += std::to_string(pool[i]) + (i < 7 ? "," : ""); }
++    return o + "]";
++}
++
++template <typename T>
++static std::string vq_arr(const std::vector<T> & v) {
++    std::string o = "[";
++    for (size_t i = 0; i < v.size(); i++) { o += std::to_string(v[i]) + (i + 1 < v.size() ? "," : ""); }
++    return o + "]";
++}
++
++static std::vector<std::string> vq_split(const std::string & s, char sep) {
++    std::vector<std::string> r;
++    size_t i = 0;
++    while (i <= s.size()) {
++        size_t j = s.find(sep, i);
++        if (j == std::string::npos) { j = s.size(); }
++        if (j > i) { r.push_back(s.substr(i, j - i)); }
++        i = j + 1;
++    }
++    return r;
++}
++
++static int vq_batch_run(const common_params & params, llama_context * lctx, common_sampler * smpl,
++                        const common_chat_templates * tmpls, mtmd_bitmap * speaker, mtmd_helper::gen_audio & gen,
++                        const std::string & manifest_path) {
++    const char * e_out = getenv("VQ_OUT");
++    const std::string out_pre = e_out ? e_out : "vq_";
++    const char * e_sys = getenv("VQ_SYS");
++    const std::vector<std::string> sys_files = e_sys ? vq_split(e_sys, ':') : std::vector<std::string>();
++    const char * e_tasks = getenv("VQ_TASKS");
++    const bool tasks = e_tasks && atoi(e_tasks) != 0;
++    const char * e_cd = getenv("VQ_CLEAR_DATA");
++    const bool clear_data = e_cd && atoi(e_cd) != 0;
++    const int n_skip = 8; // frame scartati dalla finestra misurata (contratto v5)
++
++    const std::string manifest = vq_read(manifest_path);
++    if (manifest.empty()) {
++        LOG_ERR("VQ_BATCH: manifest %s vuoto o illeggibile\n", manifest_path.c_str());
++        return 1;
++    }
++    FILE * jl = fopen((out_pre + "vq.jsonl").c_str(), "ab");
++    if (!jl) {
++        LOG_ERR("VQ_BATCH: non posso scrivere %svq.jsonl\n", out_pre.c_str());
++        return 1;
++    }
++    {
++        uint64_t hz = 0;
++        vq_ctr_json(&hz);
++        std::string m = "{\"meta\":{\"hz\":" + std::to_string(hz) + ",\"nt\":" + std::to_string(GGML_VQ_NT) + ",\"nf\":" + std::to_string(GGML_VQ_NF) +
++            ",\"fields\":[\"rows\",\"bytes\",\"work\",\"barrier\",\"idle\",\"strag\",\"strag_late\",\"nodes\",\"nbar\",\"graphs\",\"graph_t\",\"spare\"]" +
++            ",\"pool_fields\":[\"graphs\",\"graph_t\",\"pools\",\"pool_t\"],\"vq_ctr\":" + std::to_string(ggml_vq_on) +
++            ",\"n_threads\":" + std::to_string(params.cpuparams.n_threads) + ",\"n_skip\":" + std::to_string(n_skip) +
++            ",\"clear_data\":" + std::to_string(clear_data) + ",\"seed\":" + std::to_string(params.sampling.seed) + "}}\n";
++        fwrite(m.data(), 1, m.size(), jl);
++        fflush(jl);
++    }
++
++    const int max_new = params.n_predict > 0 ? params.n_predict : 512;
++    int n_ok = 0;
++    for (const std::string & line : vq_split(manifest, '\n')) {
++        const std::vector<std::string> col = vq_split(line, '\t');
++        if (col.size() < 2) {
++            continue;
++        }
++        const std::string & name = col[0];
++        const bool warm = col.size() > 2 && col[2] == "w";
++        std::string text = vq_read(col[1]);
++        if (!text.empty() && text.back() == '\n') {
++            text.pop_back();
++        }
++        std::string prompt = common_chat_get_tts_prompt(tmpls, text, params.tts_lang, params.tts_voice);
++        if (prompt.empty()) {
++            prompt = text;
++        }
++
++        const int64_t t_w0 = ggml_vq_us();
++        const std::string sys0 = vq_sys(sys_files, tasks);
++
++        // reset completo: come un processo appena avviato
++        llama_memory_clear(llama_get_memory(lctx), clear_data);
++        common_sampler_reset(smpl);
++        mtmd_helper_vq_clear();
++
++        mtmd_helper_gen_audio_inp inp = mtmd_helper_gen_audio_inp_default();
++        inp.seq_id      = 0;
++        inp.prompt      = prompt.c_str();
++        inp.prompt_len  = prompt.size();
++        inp.speaker_ref = speaker;
++        inp.lang        = params.tts_lang.c_str();
++        inp.top_k       = params.sampling.top_k;
++        inp.top_p       = params.sampling.top_p;
++        inp.seed        = params.sampling.seed;
++        if (gen.set_input(&inp) != 0) {
++            LOG_ERR("VQ_BATCH %s: set_input failed\n", name.c_str());
++            return 1;
++        }
++
++        const int64_t t_p0 = ggml_vq_us();
++        for (;;) {
++            const int32_t ret = gen.step_prompt(params.n_batch);
++            if (ret < 0) {
++                LOG_ERR("VQ_BATCH %s: prompt processing failed\n", name.c_str());
++                return 1;
++            }
++            if (ret == 0) {
++                break;
++            }
++        }
++        const int64_t t_p1 = ggml_vq_us();
++
++        llama_token sampled = common_sampler_sample(smpl, lctx, -1);
++        common_sampler_accept(smpl, sampled, true);
++        const float * h_state = llama_get_embeddings_ith(lctx, -1);
++
++        uint64_t hz = 0;
++        const std::string ctr_a = vq_ctr_json(&hz); // inizio generazione
++        std::string ctr_b;                          // dopo n_skip frame: inizio finestra misurata
++        std::vector<int64_t> f_us, d_us, c_us, b_us;
++        const int64_t * st = mtmd_helper_vq_stage_us();
++        bool stop = false;
++        int n_frames = 0;
++        const int64_t t_g0 = ggml_vq_us();
++        while (!stop && n_frames < max_new) {
++            const float * h_next = nullptr;
++            const int64_t s0[3] = { st[0], st[1], st[2] };
++            const int64_t t0 = ggml_vq_us();
++            if (gen.step_gen(sampled, h_state, &h_next, &stop) != 0) {
++                LOG_ERR("VQ_BATCH %s: step_gen failed at frame %d\n", name.c_str(), n_frames);
++                return 1;
++            }
++            if (!h_next) {
++                break;
++            }
++            n_frames++;
++            h_state = h_next;
++            sampled = common_sampler_sample(smpl, lctx, -1);
++            common_sampler_accept(smpl, sampled, true);
++            const int64_t t1 = ggml_vq_us();
++            f_us.push_back(t1 - t0);
++            d_us.push_back(st[0] - s0[0]);
++            c_us.push_back(st[1] - s0[1]);
++            b_us.push_back(st[2] - s0[2]);
++            if (n_frames == n_skip) {
++                ctr_b = vq_ctr_json(&hz);
++            }
++        }
++        const int64_t t_g1 = ggml_vq_us();
++        const std::string ctr_c = vq_ctr_json(&hz); // fine generazione
++        if (ctr_b.empty()) {
++            ctr_b = ctr_c;
++        }
++
++        int32_t      sample_rate = 0;
++        const char * data        = nullptr;
++        size_t       data_len    = 0;
++        int64_t      n_samples   = 0;
++        const int64_t t_o0 = ggml_vq_us();
++        if (gen.get_output(&sample_rate, &data, &data_len, &n_samples) != 0) {
++            LOG_ERR("VQ_BATCH %s: get_output failed\n", name.c_str());
++            return 1;
++        }
++        const int64_t t_o1 = ggml_vq_us();
++
++        if (FILE * f = fopen((out_pre + name + ".wav").c_str(), "wb")) {
++            fwrite(data, 1, data_len, f);
++            fclose(f);
++        } else {
++            LOG_ERR("VQ_BATCH %s: non posso scrivere il wav\n", name.c_str());
++            return 1;
++        }
++        size_t n_codes = 0;
++        const int32_t * codes = mtmd_helper_vq_codes(&n_codes);
++        if (FILE * f = fopen((out_pre + name + ".codes").c_str(), "wb")) {
++            fwrite(codes, sizeof(int32_t), n_codes, f);
++            fclose(f);
++        } else {
++            LOG_ERR("VQ_BATCH %s: non posso scrivere i codici\n", name.c_str());
++            return 1;
++        }
++        const std::string sys1 = vq_sys(sys_files, tasks);
++        const int64_t t_w1 = ggml_vq_us();
++
++        std::string j = "{\"name\":" + vq_json(name) + ",\"warm\":" + std::to_string(warm) + ",\"n_frames\":" + std::to_string(n_frames) +
++            ",\"n_codes\":" + std::to_string(n_codes) + ",\"n_samples\":" + std::to_string(n_samples) + ",\"sr\":" + std::to_string(sample_rate) +
++            ",\"wav_bytes\":" + std::to_string(data_len) + ",\"wall_us\":" + std::to_string(t_w1 - t_w0) +
++            ",\"t_prompt_us\":" + std::to_string(t_p1 - t_p0) + ",\"t_gen_us\":" + std::to_string(t_g1 - t_g0) + ",\"t_out_us\":" + std::to_string(t_o1 - t_o0) +
++            ",\"hz\":" + std::to_string(hz) + ",\"frame_us\":" + vq_arr(f_us) + ",\"depth_us\":" + vq_arr(d_us) +
++            ",\"codec_us\":" + vq_arr(c_us) + ",\"bb_us\":" + vq_arr(b_us) +
++            ",\"ctr_a\":" + ctr_a + ",\"ctr_b\":" + ctr_b + ",\"ctr_c\":" + ctr_c +
++            ",\"sys0\":" + sys0 + ",\"sys1\":" + sys1 + "}\n";
++        fwrite(j.data(), 1, j.size(), jl);
++        fflush(jl);
++        LOG_INF("VQ %s%s: %d frames, gen %.3fs (%.2f ms/frame), wall %.3fs\n", name.c_str(), warm ? " (warm-up)" : "", n_frames,
++                (t_g1 - t_g0) / 1e6, n_frames ? (t_g1 - t_g0) / 1e3 / n_frames : 0.0, (t_w1 - t_w0) / 1e6);
++        n_ok++;
++    }
++    fclose(jl);
++    llama_backend_free();
++    return n_ok > 0 ? 0 : 1;
++}
++// VQ-END vq.h
